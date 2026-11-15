@@ -140,6 +140,8 @@ function renderSettingsPage() {
     btn.disabled = true;
     btn.textContent = "Saving…";
     try {
+      const nameError = await premiumNameError(ign, platform);
+      if (nameError) throw new Error(nameError);
       const { error } = await sb.rpc("set_my_profile", {
         p_username: ign,
         p_platform: platform || null,

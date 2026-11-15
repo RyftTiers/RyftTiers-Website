@@ -4,6 +4,27 @@
 // means here, and the tab vanishes the moment that succeeds.
 const VERIFY_REGIONS = ["NA", "EU", "AS", "ME", "AU"];
 
+// Cracked players can't verify with a name that belongs to a premium
+// (paid) Minecraft account: on a cracked server their UUID is the offline
+// one, never the account's real UUID, so the name isn't theirs. Mojang's
+// API doesn't allow browser requests, so this asks playerdb.co (a CORS-
+// friendly Mojang mirror). It only gives quick feedback; the Discord bot
+// re-checks every save against Mojang and undoes any that slip through.
+// Returns an error message, or null when the name is fine or the lookup
+// failed (never block someone because the lookup is down).
+async function premiumNameError(ign, platform) {
+  if (platform !== "cracked" || !ign) return null;
+  try {
+    const res = await fetch(`https://playerdb.co/api/player/minecraft/${encodeURIComponent(ign)}`);
+    const body = await res.json();
+    if (body && body.code === "player.found" && body.data && body.data.player) {
+      const name = body.data.player.username || ign;
+      return `"${name}" is a premium (paid) Minecraft account, so it can't be used on a cracked account. If it's yours, pick Premium as your platform; otherwise use your own cracked username.`;
+    }
+  } catch (_) { /* lookup unavailable: let the bot decide */ }
+  return null;
+}
+
 function isVerified() {
   return !!(currentProfile && currentProfile.region);
 }
@@ -96,6 +117,12 @@ function renderVerifyTab() {
     const submitBtn = e.target.querySelector("button[type=submit]");
     submitBtn.disabled = true;
     try {
+      const nameError = await premiumNameError(ign, platform);
+      if (nameError) {
+        errorEl.textContent = nameError;
+        submitBtn.disabled = false;
+        return;
+      }
       const { error } = await sb.rpc("set_my_profile", {
         p_username: ign,
         p_platform: platform,

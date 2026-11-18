@@ -13,7 +13,7 @@
 // Everything in this file is plain fetch/Response code with no Cloudflare
 // specific imports, so it can be unit tested in Node (see tests/).
 
-export const API_VERSION = "1.0.0";
+export const API_VERSION = "1.1.0";
 
 // Same public project the website uses (js/supabase-client.js). The anon key
 // is safe to ship: it only grants what RLS allows, which is public reads.
@@ -149,6 +149,7 @@ function shapePlayer(row) {
   return {
     id: row.id,
     username: row.username,
+    uuid: row.uuid || null,
     region: row.region || null,
     platform: row.platform || null,
     points: tiers.reduce((sum, t) => sum + t.points, 0),
@@ -156,7 +157,7 @@ function shapePlayer(row) {
   };
 }
 
-const PLAYER_SELECT = "id,username,region,platform,player_tiers(gamemode,tier,updated_at)";
+const PLAYER_SELECT = "id,username,uuid,region,platform,player_tiers(gamemode,tier,updated_at)";
 
 // ------------------------------------------------------------------
 // Query parameter helpers
@@ -177,6 +178,14 @@ function requireGamemode(gamemode) {
     throw new ApiError(404, `Unknown gamemode "${gamemode}". Known gamemodes: ${GAMEMODES.join(", ")}`);
   }
   return gm;
+}
+
+// Accepts a Minecraft UUID with or without dashes, in any case, and returns
+// it in the dashed lower-case form RyftTiers stores. Null if it isn't one.
+export function normalizeUUID(raw) {
+  const hex = String(raw || "").trim().toLowerCase().replace(/-/g, "");
+  if (!/^[0-9a-f]{32}$/.test(hex)) return null;
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
 function requireUsername(name) {
@@ -201,9 +210,44 @@ async function getPlayer(db, username) {
   return shapePlayer(rows[0]);
 }
 
+async function getPlayerByUUID(db, raw) {
+  const uuid = normalizeUUID(raw);
+  if (!uuid) throw new ApiError(400, `Invalid UUID "${raw}"`);
+  const rows = await db.get(`players?select=${PLAYER_SELECT}&uuid=eq.${uuid}&limit=1`);
+  if (!rows.length) throw new ApiError(404, `No RyftTiers player has UUID ${uuid}`);
+  return shapePlayer(rows[0]);
+}
+
+// ?uuids=a,b,c: same { count, items, missing } shape as ?names=. "missing"
+// echoes each UUID exactly as it was sent.
+async function getPlayersByUUID(db, raw) {
+  const seen = new Map(); // normalized (or raw if invalid) -> as sent
+  for (const u of raw.split(",").map((s) => s.trim()).filter(Boolean)) {
+    const key = normalizeUUID(u) || `invalid:${u}`;
+    if (!seen.has(key)) seen.set(key, u);
+  }
+  if (seen.size > BATCH_MAX) throw new ApiError(400, `At most ${BATCH_MAX} UUIDs per request`);
+  const lookup = [...seen.keys()].filter((k) => !k.startsWith("invalid:"));
+  const rows = lookup.length
+    ? await db.get(`players?select=${PLAYER_SELECT}&uuid=${encodeURIComponent(inList(lookup))}`)
+    : [];
+  const found = new Map(rows.map((r) => [r.uuid, shapePlayer(r)]));
+  const items = [];
+  const missing = [];
+  for (const [key, original] of seen) {
+    if (found.has(key)) items.push(found.get(key));
+    else missing.push(original);
+  }
+  return { count: items.length, items, missing };
+}
+
 async function getPlayers(db, params) {
+  const uuids = params.get("uuids");
+  if (uuids !== null && uuids.trim() !== "") return getPlayersByUUID(db, uuids);
   const raw = params.get("names");
-  if (raw === null || raw.trim() === "") throw new ApiError(400, "names is required, e.g. ?names=Steve,Alex");
+  if (raw === null || raw.trim() === "") {
+    throw new ApiError(400, "names or uuids is required, e.g. ?names=Steve,Alex");
+  }
   // Dedupe case-insensitively but keep the caller's spelling for "missing".
   // A name that can't be a username can't be on RyftTiers either, so it is
   // reported as missing instead of failing the whole batch.
@@ -234,7 +278,7 @@ async function getPlayers(db, params) {
 // reads. Used by the leaderboards, which are then cached for 5 minutes.
 async function loadAllRankedPlayers(db) {
   const [players, tiers] = await Promise.all([
-    db.getAll("players?select=id,username,region,platform&order=id.asc"),
+    db.getAll("players?select=id,username,uuid,region,platform&order=id.asc"),
     db.getAll("player_tiers?select=player_id,gamemode,tier,updated_at&order=player_id.asc,gamemode.asc"),
   ]);
   const tiersByPlayer = new Map();
@@ -256,6 +300,7 @@ function gamemodeEntries(players, gamemode) {
       rank: i + 1,
       id: p.id,
       username: p.username,
+      uuid: p.uuid,
       region: p.region,
       platform: p.platform,
       tier: t.tier,
@@ -283,6 +328,7 @@ async function getGlobalLeaderboard(db, params) {
       rank: i + 1,
       id: p.id,
       username: p.username,
+      uuid: p.uuid,
       region: p.region,
       platform: p.platform,
       points: p.points,
@@ -294,7 +340,7 @@ async function getGamemodeTiers(db, gamemode, params) {
   const gm = requireGamemode(gamemode);
   const limit = parseLimit(params, { min: 1, max: 100, fallback: 50 });
   const rows = await db.get(
-    `player_tiers?select=tier,updated_at,players(id,username,region,platform)` +
+    `player_tiers?select=tier,updated_at,players(id,username,uuid,region,platform)` +
       `&gamemode=eq.${gm}&order=updated_at.desc&limit=${limit}`
   );
   return rows
@@ -302,6 +348,7 @@ async function getGamemodeTiers(db, gamemode, params) {
     .map((r) => ({
       id: r.players.id,
       username: r.players.username,
+      uuid: r.players.uuid || null,
       region: r.players.region || null,
       platform: r.players.platform || null,
       gamemode: gm,
@@ -315,11 +362,12 @@ async function getRecent(db, params) {
   const limit = parseLimit(params, { min: 1, max: 100, fallback: 20 });
   const rows = await db.get(
     `test_log?select=id,gamemode,tier,previous_tier,tester_names,region,created_at,` +
-      `players!test_log_player_id_fkey(username)&order=created_at.desc&limit=${limit}`
+      `players!test_log_player_id_fkey(username,uuid)&order=created_at.desc&limit=${limit}`
   );
   return rows.map((r) => ({
     id: r.id,
     username: r.players ? r.players.username : null,
+    uuid: r.players ? r.players.uuid || null : null,
     gamemode: r.gamemode,
     tier: r.tier,
     previousTier: r.previous_tier || null,
@@ -346,6 +394,8 @@ function getIndex() {
     endpoints: [
       "GET /api/players/{username}",
       "GET /api/players?names=a,b,c",
+      "GET /api/players/uuid/{uuid}",
+      "GET /api/players?uuids=a,b,c",
       "GET /api/leaderboard",
       "GET /api/leaderboard?gamemode={gamemode}",
       "GET /api/leaderboard/global?limit=1-500",
@@ -364,6 +414,7 @@ async function route(db, segments, params) {
   if (a === undefined) return getIndex();
   if (a === "health" && !b) return getHealth(db);
   if (a === "players" && !b) return getPlayers(db, params);
+  if (a === "players" && b === "uuid" && c) return getPlayerByUUID(db, c);
   if (a === "players" && b && !c) return getPlayer(db, b);
   if (a === "leaderboard" && !b) return getLeaderboard(db, params);
   if (a === "leaderboard" && b === "global" && !c) return getGlobalLeaderboard(db, params);

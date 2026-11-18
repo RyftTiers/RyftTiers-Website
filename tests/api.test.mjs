@@ -5,10 +5,10 @@ import { handleRequest, createRateLimiter } from "../server/api.mjs";
 
 // --- fake Supabase -------------------------------------------------
 const PLAYERS = [
-  { id: 1, username: "Steve", region: "NA", platform: "premium" },
-  { id: 2, username: "Alex", region: "EU", platform: "premium" },
-  { id: 3, username: ".BedrockGuy", region: "AS", platform: "bedrock" },
-  { id: 4, username: "NoTiers", region: "NA", platform: "cracked" },
+  { id: 1, username: "Steve", uuid: "8667ba71-b85a-4004-af54-457a9734eed7", region: "NA", platform: "premium" },
+  { id: 2, username: "Alex", uuid: "ec561538-f3fd-461d-aff5-086b22154bce", region: "EU", platform: "premium" },
+  { id: 3, username: ".BedrockGuy", uuid: null, region: "AS", platform: "bedrock" },
+  { id: 4, username: "NoTiers", uuid: null, region: "NA", platform: "cracked" },
 ];
 const TIERS = [
   { player_id: 1, gamemode: "vanilla", tier: "LT2", updated_at: "2026-11-01T00:00:00Z" },
@@ -18,7 +18,7 @@ const TIERS = [
   { player_id: 3, gamemode: "vanilla", tier: "LT2", updated_at: "2026-11-04T00:00:00Z" },
 ];
 const LOG = [
-  { id: 9, gamemode: "sword", tier: "HT1", previous_tier: "LT1", tester_names: ["Tester"], region: "NA", created_at: "2026-11-03T00:00:00Z", players: { username: "Steve" } },
+  { id: 9, gamemode: "sword", tier: "HT1", previous_tier: "LT1", tester_names: ["Tester"], region: "NA", created_at: "2026-11-03T00:00:00Z", players: { username: "Steve", uuid: "8667ba71-b85a-4004-af54-457a9734eed7" } },
 ];
 
 const withTiers = (p) => ({ ...p, player_tiers: TIERS.filter((t) => t.player_id === p.id).map(({ player_id, ...t }) => t) });
@@ -38,6 +38,12 @@ function fakeSupabase(url, init) {
     if (eq && eq.startsWith("in.(")) {
       const names = eq.slice(4, -1).split(",").map((s) => s.replace(/^"|"$/g, ""));
       rows = rows.filter((p) => names.includes(p.username.toLowerCase()));
+    }
+    const uu = q.get("uuid");
+    if (uu && uu.startsWith("eq.")) rows = rows.filter((p) => p.uuid === uu.slice(3));
+    if (uu && uu.startsWith("in.(")) {
+      const ids = uu.slice(4, -1).split(",").map((s) => s.replace(/^"|"$/g, ""));
+      rows = rows.filter((p) => ids.includes(p.uuid));
     }
     if (q.get("select").includes("player_tiers")) rows = rows.map(withTiers);
   } else if (table === "player_tiers") {
@@ -83,7 +89,7 @@ test("single player, case-insensitive, tiers best first with points", async () =
   assert.equal(res.headers.get("Access-Control-Allow-Origin"), "*");
   assert.match(res.headers.get("Cache-Control"), /max-age=300/);
   assert.deepEqual(body, {
-    id: 1, username: "Steve", region: "NA", platform: "premium", points: 170,
+    id: 1, username: "Steve", uuid: "8667ba71-b85a-4004-af54-457a9734eed7", region: "NA", platform: "premium", points: 170,
     tiers: [
       { gamemode: "sword", tier: "HT1", points: 100, updatedAt: "2026-11-03T00:00:00Z" },
       { gamemode: "vanilla", tier: "LT2", points: 70, updatedAt: "2026-11-01T00:00:00Z" },
@@ -204,7 +210,7 @@ test("gamemodes and gamemode tiers", async () => {
 test("recent tests", async () => {
   const { body } = await get("/api/recent");
   assert.deepEqual(body[0], {
-    id: 9, username: "Steve", gamemode: "sword", tier: "HT1", previousTier: "LT1",
+    id: 9, username: "Steve", uuid: "8667ba71-b85a-4004-af54-457a9734eed7", gamemode: "sword", tier: "HT1", previousTier: "LT1",
     region: "NA", testers: ["Tester"], testedAt: "2026-11-03T00:00:00Z",
   });
 });
@@ -259,4 +265,34 @@ test("rate limiter returns 429 with Retry-After", async () => {
   assert.equal(limited.headers.get("Retry-After"), "60");
   now = 60_000;
   assert.equal((await req()).status, 200);
+});
+
+test("lookup by UUID, with or without dashes, any case", async () => {
+  for (const id of ["8667ba71-b85a-4004-af54-457a9734eed7", "8667BA71B85A4004AF54457A9734EED7"]) {
+    const { status, body } = await get("/api/players/uuid/" + id);
+    assert.equal(status, 200);
+    assert.equal(body.username, "Steve");
+    assert.equal(body.uuid, "8667ba71-b85a-4004-af54-457a9734eed7");
+  }
+  assert.equal((await get("/api/players/uuid/00000000-0000-0000-0000-000000000000")).status, 404);
+  assert.equal((await get("/api/players/uuid/not-a-uuid")).status, 400);
+});
+
+test("batch lookup by UUID echoes misses as sent", async () => {
+  const { status, body } = await get(
+    "/api/players?uuids=ec561538f3fd461daff5086b22154bce,8667ba71-b85a-4004-af54-457a9734eed7,00000000-0000-0000-0000-000000000000,nope,EC561538-F3FD-461D-AFF5-086B22154BCE"
+  );
+  assert.equal(status, 200);
+  assert.equal(body.count, 2);
+  assert.deepEqual(body.items.map((p) => p.username), ["Alex", "Steve"]);
+  assert.deepEqual(body.missing, ["00000000-0000-0000-0000-000000000000", "nope"]);
+  const many = Array.from({ length: 51 }, (_, i) => i.toString(16).padStart(32, "0")).join(",");
+  assert.equal((await get("/api/players?uuids=" + many)).status, 400);
+});
+
+test("players without a saved UUID have uuid null", async () => {
+  const { body } = await get("/api/players/" + encodeURIComponent(".BedrockGuy"));
+  assert.equal(body.uuid, null);
+  const { body: lb } = await get("/api/leaderboard/global");
+  assert.equal(lb.find((e) => e.username === "Steve").uuid, "8667ba71-b85a-4004-af54-457a9734eed7");
 });

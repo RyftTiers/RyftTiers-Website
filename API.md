@@ -193,4 +193,4 @@ limits to public reads. To point it at another project, set
 `SUPABASE_URL` and `SUPABASE_ANON_KEY` in the Pages project's environment
 variables.
 
-Tests: `node --test tests/` (Node 18+, no install needed).
+Tests: `node --test tests/api.test.mjs` (Node 18+, no install needed).
